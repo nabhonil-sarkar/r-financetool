@@ -1,7 +1,3 @@
-# 1. AUTO-INSTALL & LOAD LIBRARIES
-packages <- c("shiny", "shinydashboard", "DT", "tidyverse", "plotly")
-new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
-if(length(new_packages)) install.packages(new_packages)
 
 library(shiny)
 library(shinydashboard)
@@ -20,28 +16,29 @@ ui <- dashboardPage(
                 choices = c("Dark Mode" = "dark", "Light Mode" = "light")),
     uiOutput("filter_ui"),
     hr(),
+    # NEW: Let the user choose how to size the treemap
+    selectInput("tree_metric", "3. Treemap Size By:", 
+                choices = c("Position Count" = "count", "Assignment Risk ($)" = "risk")),
+    hr(),
     downloadButton("downloadData", "Export Analysis", class = "btn-block")
   ),
   
   dashboardBody(
-    uiOutput("style_css"), # Injects Dynamic Theme
+    uiOutput("style_css"), 
     
-    # KPIs
     fluidRow(
       valueBoxOutput("total_exposure", width = 4),
       valueBoxOutput("avg_dte", width = 4),
       valueBoxOutput("risk_status", width = 4)
     ),
     
-    # Visualizations
     fluidRow(
-      box(title = "Allocation (Size by Assignment Risk)", status = "primary", width = 7, 
+      box(title = "Portfolio Hierarchy (Symbol -> Asset Type)", status = "primary", width = 7, 
           plotlyOutput("treemap_plot")),
-      box(title = "Assignment Risk by Symbol", status = "info", width = 5, 
+      box(title = "Risk by Symbol", status = "info", width = 5, 
           plotOutput("symbol_plot"))
     ),
     
-    # Data Table
     fluidRow(
       box(title = "Detailed Risk Analytics", status = "warning", width = 12, 
           DTOutput("portfolio_table"))
@@ -52,7 +49,7 @@ ui <- dashboardPage(
 # 3. SERVER LOGIC
 server <- function(input, output, session) {
   
-  # --- Dynamic CSS Switcher ---
+  # --- Dynamic CSS ---
   output$style_css <- renderUI({
     if (input$theme_choice == "dark") {
       tags$head(tags$style(HTML("
@@ -67,7 +64,7 @@ server <- function(input, output, session) {
     }
   })
   
-  # --- Data Processing Engine ---
+  # --- Data Processing ---
   raw_data <- reactive({
     req(input$upload)
     df <- read_csv(input$upload$datapath)
@@ -75,26 +72,23 @@ server <- function(input, output, session) {
     df %>%
       mutate(
         Last_Price = as.numeric(gsub("C", "", as.character(Last))),
-        # Break-Even Calculation
         Break_Even = case_when(
           Type == "OPT" & `P/C` == "C" ~ Strike + Last_Price,
           Type == "OPT" & `P/C` == "P" ~ Strike - Last_Price,
           TRUE ~ Last_Price
         ),
-        # Put Assignment Risk (Strike * 100 shares)
+        # Assignment risk is only for Put Options
         Assignment_Cost = ifelse(Type == "OPT" & `P/C` == "P", Strike * 100, 0),
-        # Days to Expiry (DTE)
-        DTE = ifelse(Type == "OPT", 
+        DTE = ifelse(Type %in% c("OPT", "BAG") & !is.na(Expiry), 
                      as.numeric(difftime(as.Date(paste0(Expiry, "01"), "%Y%m%d"), Sys.Date(), units="days")), 
                      NA)
       )
   })
   
-  # Dynamic Filter Generator
   output$filter_ui <- renderUI({
     data <- raw_data()
     tagList(
-      selectInput("symbol_select", "3. Filter Ticker:", choices = sort(unique(data$Symbol)), multiple = TRUE)
+      selectInput("symbol_select", "4. Filter Ticker:", choices = sort(unique(data$Symbol)), multiple = TRUE)
     )
   })
   
@@ -107,7 +101,7 @@ server <- function(input, output, session) {
   # --- Value Boxes ---
   output$total_exposure <- renderValueBox({ 
     total <- sum(filtered_data()$Assignment_Cost, na.rm = TRUE)
-    valueBox(paste0("$", format(total, big.mark=",")), "Assignment Risk", icon = icon("dollar-sign"), color = "red") 
+    valueBox(paste0("$", format(total, big.mark=",")), "Put Assignment Risk", icon = icon("dollar-sign"), color = "red") 
   })
   
   output$avg_dte <- renderValueBox({ 
@@ -119,28 +113,35 @@ server <- function(input, output, session) {
     valueBox("Calculated", "Risk Engine", icon = icon("gears"), color = "blue")
   })
   
-  # --- Treemap Logic (Fixed Hierarchy) ---
+  # --- FIXED Treemap Logic ---
   output$treemap_plot <- renderPlotly({
     df <- filtered_data()
     req(nrow(df) > 0)
     
-    # Children (Symbols)
+    # Apply the sizing logic based on the user's dropdown choice
+    if(input$tree_metric == "risk") {
+      df$plot_val <- df$Assignment_Cost + 0.1 # Add 0.1 so $0 items don't completely vanish
+    } else {
+      df$plot_val <- 1 # Every single row gets equal weight (Position Count)
+    }
+    
+    # Level 2: Asset Types (The Children) -> IDs MUST be unique
     lvl2 <- df %>% 
       group_by(Symbol, Type) %>% 
-      summarise(values = sum(Assignment_Cost, na.rm = TRUE) + 0.1, .groups = 'drop') %>% 
-      rename(labels = Symbol, parents = Type)
+      summarise(values = sum(plot_val, na.rm = TRUE), .groups = 'drop') %>% 
+      mutate(ids = paste(Symbol, Type, sep="-"), parents = Symbol, labels = Type)
     
-    # Parents (Asset Types)
+    # Level 1: Symbols (The Parents)
     lvl1 <- df %>% 
-      group_by(Type) %>% 
-      summarise(values = sum(Assignment_Cost, na.rm = TRUE) + 0.1, .groups = 'drop') %>% 
-      rename(labels = Type) %>% 
-      mutate(parents = "")
+      group_by(Symbol) %>% 
+      summarise(values = sum(plot_val, na.rm = TRUE), .groups = 'drop') %>% 
+      mutate(ids = Symbol, parents = "", labels = Symbol)
     
     plot_data <- bind_rows(lvl1, lvl2)
     
-    plot_ly(data = plot_data, type = "treemap", labels = ~labels, parents = ~parents,
-            values = ~values, textinfo = "label+value", marker = list(colorscale = 'Blues')) %>%
+    plot_ly(data = plot_data, type = "treemap", 
+            ids = ~ids, labels = ~labels, parents = ~parents, values = ~values, 
+            textinfo = "label+value", marker = list(colorscale = 'Blues')) %>%
       layout(
         paper_bgcolor = if(input$theme_choice == "dark") "#2d2d38" else "white",
         font = list(color = if(input$theme_choice == "dark") "white" else "black")
@@ -176,5 +177,4 @@ server <- function(input, output, session) {
   )
 }
 
-# 4. LAUNCH
 shinyApp(ui, server)
